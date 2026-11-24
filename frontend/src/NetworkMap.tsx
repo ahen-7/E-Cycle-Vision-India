@@ -38,7 +38,7 @@ const partnerIcon = L.divIcon({
 });
 
 export default function NetworkMap({
-  apiBaseUrl = 'http://127.0.0.1:8000'
+  apiBaseUrl = import.meta.env.VITE_API_URL || 'http://127.0.0.1:8000'
 }: NetworkMapProps) {
   const [partners, setPartners] = useState<Partner[]>([]);
   const [loading, setLoading] = useState(true);

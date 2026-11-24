@@ -6,7 +6,7 @@ import PartnerDashboard from './PartnerDashboard'
 import NetworkMap from './NetworkMap';
 import LocationPicker from './LocationPicker';
 
-const API = 'http://127.0.0.1:8000'
+const API = import.meta.env.VITE_API_URL || 'http://127.0.0.1:8000'
 
 type CollectionForm = {
   requester_name: string
