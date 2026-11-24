@@ -50,7 +50,7 @@ add_missing_columns("partners", {
     "registration_number": "VARCHAR",
     "authorization_details": "TEXT",
     "verification_notes": "TEXT",
-    "verified_at": "DATETIME",
+    "verified_at": "TIMESTAMP",
     "latitude": "FLOAT",
     "longitude": "FLOAT"
 })

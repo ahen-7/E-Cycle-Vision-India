@@ -15,6 +15,8 @@ from fastapi.responses import FileResponse
 import jwt
 from pwdlib import PasswordHash
 from database import get_db
+import init_db
+from init_db import Base
 from models import PartnerOffer
 from models import CollectionRequest as DBCollectionRequest
 from models import TrackingHistory, Partner, PartnerApplication,User
