@@ -1,0 +1,49 @@
+
+.location-picker {
+  grid-column: 1 / -1;
+  margin: 12px 0;
+  padding: 16px;
+  border: 1px solid #345441;
+  border-radius: 12px;
+  background: #12231a;
+}
+
+.location-picker-heading h3 {
+  margin: 0 0 8px;
+  color: #e8f0eb;
+}
+
+.location-picker-heading p {
+  margin: 0 0 14px;
+  color: #aabbb0;
+  font-size: 13px;
+}
+
+.location-picker-map {
+  width: 100%;
+  height: 350px;
+  border-radius: 10px;
+  z-index: 1;
+}
+
+.selected-location-icon {
+  background: transparent;
+  border: none;
+}
+
+.selected-location-pin {
+  font-size: 30px;
+}
+
+.selected-location-details {
+  margin-top: 12px;
+  padding: 12px;
+  border-radius: 8px;
+  background: #1a3023;
+  color: #8fe0a9;
+  font-size: 13px;
+}
+
+.selected-location-details p {
+  margin: 5px 0;
+}
