@@ -28,6 +28,14 @@ type VerificationChecks = {
   authorizationChecked: boolean
 }
 
+type OrganisationCredentials = {
+  application_id: number
+  partner_id: number
+  organisation_role: string
+  email: string
+  temporary_password: string
+}
+
 type AdminDashboardProps = {
   authToken: string
 }
@@ -38,6 +46,9 @@ export default function AdminDashboard({ authToken }: AdminDashboardProps) {
   const [checks, setChecks] = useState<Record<number, VerificationChecks>>({})
   const [message, setMessage] = useState('')
   const [loading, setLoading] = useState(false)
+  const [credentials, setCredentials] =
+    useState<OrganisationCredentials | null>(null)
+  const [credentialLoading, setCredentialLoading] = useState<number | null>(null)
 
   const authHeaders = {
     Authorization: `Bearer ${authToken}`
@@ -116,6 +127,69 @@ export default function AdminDashboard({ authToken }: AdminDashboardProps) {
     }))
   }
 
+  const copyCredentials = async () => {
+    if (!credentials) return
+
+    const text = [
+      `Application ID: ${credentials.application_id}`,
+      `Partner ID: ${credentials.partner_id}`,
+      `Organisation Role: ${credentials.organisation_role}`,
+      `Email: ${credentials.email}`,
+      `Temporary Password: ${credentials.temporary_password}`
+    ].join('\n')
+
+    try {
+      await navigator.clipboard.writeText(text)
+      setMessage('Login credentials copied successfully.')
+    } catch {
+      setMessage('Unable to copy automatically. Please copy the credentials manually.')
+    }
+  }
+
+  const regenerateCredentials = async (applicationId: number) => {
+    if (!window.confirm(
+      'Regenerate login credentials? The existing password will stop working.'
+    )) {
+      return
+    }
+
+    try {
+      setCredentialLoading(applicationId)
+      setCredentials(null)
+      setMessage('')
+
+      const response = await fetch(
+        `${API}/admin/partner-applications/${applicationId}/regenerate-credentials`,
+        {
+          method: 'POST',
+          headers: authHeaders
+        }
+      )
+
+      const data = await response.json()
+
+      if (!response.ok) {
+        throw new Error(data.detail || 'Unable to regenerate credentials')
+      }
+
+      setCredentials({
+        application_id: data.application_id,
+        partner_id: data.partner_id,
+        organisation_role: data.organisation_role,
+        email: data.email,
+        temporary_password: data.temporary_password
+      })
+
+      setMessage('New organisation login credentials generated successfully.')
+    } catch (error) {
+      setMessage(
+        error instanceof Error ? error.message : 'Credential generation failed'
+      )
+    } finally {
+      setCredentialLoading(null)
+    }
+  }
+
   const reviewApplication = async (
     applicationId: number,
     action: 'approve' | 'reject'
@@ -155,6 +229,7 @@ export default function AdminDashboard({ authToken }: AdminDashboardProps) {
 
     try {
       setLoading(true)
+      setCredentials(null)
 
       const parameter = action === 'approve' ? 'notes' : 'reason'
 
@@ -172,7 +247,26 @@ export default function AdminDashboard({ authToken }: AdminDashboardProps) {
         throw new Error(data.detail || 'Review failed')
       }
 
-      setMessage(data.message || `Application ${action}d successfully.`)
+      if (
+        action === 'approve' &&
+        data.temporary_password &&
+        data.email
+      ) {
+        setCredentials({
+          application_id: data.application_id,
+          partner_id: data.partner_id,
+          organisation_role: data.organisation_role,
+          email: data.email,
+          temporary_password: data.temporary_password
+        })
+      }
+
+      setMessage(
+        action === 'approve' && data.temporary_password
+          ? 'Application approved. Organisation login credentials are displayed below.'
+          : data.message || `Application ${action}d successfully.`
+      )
+
       await loadApplications()
     } catch (error) {
       setMessage(
@@ -241,6 +335,59 @@ export default function AdminDashboard({ authToken }: AdminDashboardProps) {
         }}>
           {message}
         </p>
+      )}
+
+      {credentials && (
+        <div style={{
+          background: '#142b25',
+          border: '1px solid #58c99a',
+          borderRadius: '12px',
+          padding: '22px',
+          marginBottom: '24px'
+        }}>
+          <h2 style={{ color: '#58c99a' }}>
+            Organisation Login Credentials
+          </h2>
+
+          <p>Application ID: {credentials.application_id}</p>
+          <p>Partner ID: {credentials.partner_id}</p>
+          <p>Organisation Role: {credentials.organisation_role}</p>
+          <p>Email: {credentials.email}</p>
+
+          <div style={{
+            background: '#0c1e18',
+            padding: '12px',
+            borderRadius: '8px',
+            marginTop: '12px'
+          }}>
+            <p style={{ marginTop: 0 }}>Temporary Password:</p>
+            <strong style={{
+              color: '#58c99a',
+              wordBreak: 'break-all'
+            }}>
+              {credentials.temporary_password}
+            </strong>
+          </div>
+
+          <p style={{ color: '#e6bd78', fontSize: '13px' }}>
+            Save these credentials securely now. This temporary password
+            will not be displayed again after you leave this screen.
+            Share it only with the authorised organisation contact.
+          </p>
+
+          <button
+            onClick={copyCredentials}
+            style={{ marginRight: '10px' }}
+          >
+            Copy All Credentials
+          </button>
+
+          <button
+            onClick={() => setCredentials(null)}
+          >
+            Close
+          </button>
+        </div>
       )}
 
       <div style={{
@@ -337,6 +484,29 @@ export default function AdminDashboard({ authToken }: AdminDashboardProps) {
                 ? 'View Submitted Document'
                 : 'No Document Uploaded'}
             </button>
+
+            {app.status === 'Approved' && (
+              <div style={{ marginTop: '18px' }}>
+                <button
+                  onClick={() => regenerateCredentials(app.id)}
+                  disabled={
+                    credentialLoading !== null || loading
+                  }
+                >
+                  {credentialLoading === app.id
+                    ? 'Generating Credentials...'
+                    : 'Regenerate Login Credentials'}
+                </button>
+
+                <p style={{
+                  color: '#9aaca3',
+                  fontSize: '13px'
+                }}>
+                  Generates a new password for this existing organisation account.
+                  The previous password will stop working.
+                </p>
+              </div>
+            )}
 
             {app.status === 'Pending Verification' && (
               <div style={{ marginTop: '24px' }}>

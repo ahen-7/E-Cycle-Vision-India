@@ -288,16 +288,19 @@ function App() {
   if (!authToken) {
     return <AuthPage onAuthSuccess={handleAuthSuccess} />
   }
-
-  if (currentUser?.role === 'partner') {
-    return (
-      <PartnerDashboard
-        authToken={authToken}
-        fullName={currentUser.full_name}
-      />
-    )
-  }
-
+  if (
+  ['partner', 'aggregator', 'recycler'].includes(
+    currentUser?.role ?? ''
+  )
+) {
+  return (
+    <PartnerDashboard
+      authToken={authToken}
+      fullName={currentUser.full_name}
+      role={currentUser.role}
+    />
+  )
+}
   return (
     <div className="app-shell">
       <aside className="sidebar">
