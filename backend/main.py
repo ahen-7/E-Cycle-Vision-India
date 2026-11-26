@@ -1,25 +1,34 @@
-from fastapi import FastAPI, Depends, HTTPException
+
+from fastapi import (
+    FastAPI, Depends, HTTPException, UploadFile, File
+)
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
-bearer_scheme = HTTPBearer()
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import FileResponse
 from sqlalchemy.orm import Session
 from uuid import uuid4
-from fastapi import UploadFile, File
 from pathlib import Path
+from datetime import datetime, timedelta, timezone
 import shutil
 import os
 import secrets
-from fastapi import Header
-from datetime import datetime,timedelta,timezone
-from fastapi.responses import FileResponse
 import jwt
 from pwdlib import PasswordHash
 from database import get_db
 import init_db
-from init_db import Base
-from models import PartnerOffer
-from models import CollectionRequest as DBCollectionRequest
-from models import TrackingHistory, Partner, PartnerApplication,User
+from models import (
+    CollectionRequest as DBCollectionRequest,
+    TrackingHistory,
+    Partner,
+    PartnerApplication,
+    PartnerOffer,
+    User,
+    Collector,
+    MaterialBatch,
+    MaterialBatchItem,
+    BatchHandover,
+    RecyclerPriceOffer
+    )
 from schemas import (
     CollectionRequestCreate,
     CollectionRequestResponse,
@@ -30,8 +39,25 @@ from schemas import (
     StatusUpdate,
     UserRegister,
     UserLogin,
-    AuthResponse
+    AuthResponse,
+    CollectorCreate,
+    CollectorResponse,
+    CollectorAssignment,
+    CollectionRecord,
+    MaterialBatchCreate,
+    MaterialBatchResponse,
+    BatchHandoverCreate,
+    BatchHandoverResponse,
+    HandoverDecision,
+    RecyclerPriceOfferCreate,
+    RecyclerPriceOfferResponse 
 )
+from dotenv import load_dotenv
+load_dotenv()
+
+# ==========================================
+# CONFIGURATION
+# ==========================================
 
 ADMIN_API_KEY = os.getenv("ECYCLE_ADMIN_KEY")
 JWT_SECRET_KEY = os.getenv("ECYCLE_JWT_SECRET")
@@ -39,11 +65,15 @@ JWT_ALGORITHM = "HS256"
 ACCESS_TOKEN_EXPIRE_MINUTES = 60
 
 password_hasher = PasswordHash.recommended()
+bearer_scheme = HTTPBearer()
+
+UPLOAD_DIR = Path("uploads/partner_documents")
+UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
 
 app = FastAPI(
     title="E-Cycle Vision API",
-    description="Nationwide E-Waste Collection and Traceability Platform",
-    version="1.0.0"
+    description="E-Waste Collection and Traceability Platform",
+    version="2.0.0"
 )
 
 app.add_middleware(
@@ -55,13 +85,18 @@ app.add_middleware(
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"]
-),
+)
+
+
+# ==========================================
+# BASIC ROUTES
+# ==========================================
 
 @app.get("/")
 def home():
     return {
         "message": "Welcome to E-Cycle Vision",
-        "platform": "Nationwide E-Waste Management",
+        "platform": "E-Waste Collection and Traceability",
         "status": "Running"
     }
 
@@ -69,6 +104,11 @@ def home():
 @app.get("/health")
 def health():
     return {"status": "healthy"}
+
+
+# ==========================================
+# AUTHENTICATION AND ROLE HELPERS
+# ==========================================
 
 def get_current_user(
     credentials: HTTPAuthorizationCredentials = Depends(bearer_scheme),
@@ -82,6 +122,7 @@ def get_current_user(
             JWT_SECRET_KEY,
             algorithms=[JWT_ALGORITHM]
         )
+
         user_id = int(payload.get("sub"))
 
     except (jwt.InvalidTokenError, TypeError, ValueError):
@@ -103,6 +144,7 @@ def get_current_user(
 
     return user
 
+
 def verify_admin(
     current_user: User = Depends(get_current_user)
 ):
@@ -114,9 +156,137 @@ def verify_admin(
 
     return current_user
 
-# Create a new collection request
+def get_partner_role(partner: Partner | None):
+    """
+    Identify an organisation's role.
+    Unknown organisation types must not receive automatic access.
+    """
+    if not partner:
+        return None
 
-@app.post("/requests", response_model=CollectionRequestResponse)
+    organisation_type = (
+        partner.organisation_type or ""
+    ).strip().lower()
+
+    if "recycl" in organisation_type:
+        return "recycler"
+
+    if "refurbish" in organisation_type:
+        return "recycler"
+
+    if (
+        "collection centre" in organisation_type
+        or "collection center" in organisation_type
+        or "collection agency" in organisation_type
+        or "waste collection" in organisation_type
+        or "aggregator" in organisation_type
+    ):
+        return "aggregator"
+
+    return None
+
+def get_user_partner(
+    current_user: User,
+    db: Session
+):
+    if not current_user.partner_id:
+        raise HTTPException(
+            status_code=403,
+            detail="Organisation account is not linked to a partner"
+        )
+
+    partner = db.query(Partner).filter(
+        Partner.id == current_user.partner_id,
+        Partner.is_active == 1
+    ).first()
+
+    if not partner:
+        raise HTTPException(
+            status_code=403,
+            detail="Organisation account is inactive"
+        )
+
+    return partner
+
+
+def require_organisation_role(
+    current_user: User,
+    db: Session,
+    required_role: str
+):
+    if current_user.role == "admin":
+        raise HTTPException(
+            status_code=403,
+            detail="This operation requires an organisation account"
+        )
+
+    partner = get_user_partner(current_user, db)
+
+    actual_role = (
+        current_user.role
+        if current_user.role in ["aggregator", "recycler"]
+        else get_partner_role(partner)
+    )
+
+    if actual_role != required_role:
+        raise HTTPException(
+            status_code=403,
+            detail=f"{required_role.capitalize()} access required"
+        )
+
+    return partner
+
+
+def add_history(
+    db: Session,
+    tracking_id: str,
+    status: str,
+    remarks: str,
+    user: User | None = None,
+    partner_id: int | None = None
+):
+    db.add(
+        TrackingHistory(
+            tracking_id=tracking_id,
+            status=status,
+            remarks=remarks,
+            actor_id=user.id if user else None,
+            actor_role=user.role if user else None,
+            partner_id=partner_id
+        )
+    )
+
+
+def create_access_token(user: User):
+    if not JWT_SECRET_KEY:
+        raise HTTPException(
+            status_code=500,
+            detail="JWT secret is not configured"
+        )
+
+    payload = {
+        "sub": str(user.id),
+        "role": user.role,
+        "exp": datetime.now(timezone.utc) + timedelta(
+            minutes=ACCESS_TOKEN_EXPIRE_MINUTES
+        )
+    }
+
+    return jwt.encode(
+        payload,
+        JWT_SECRET_KEY,
+        algorithm=JWT_ALGORITHM
+    )
+
+
+# ==========================================
+# COLLECTION REQUESTS
+# ==========================================
+
+@app.post(
+    "/requests",
+    response_model=CollectionRequestResponse
+)
 def create_request(
     request: CollectionRequestCreate,
     db: Session = Depends(get_db),
@@ -148,21 +318,24 @@ def create_request(
 
     db.add(new_request)
 
-    db.add(
-        TrackingHistory(
-            tracking_id=tracking_id,
-            status="Requested",
-            remarks="Collection request submitted"
-        )
+    add_history(
+        db,
+        tracking_id,
+        "Requested",
+        "Collection request submitted",
+        current_user
     )
 
     db.commit()
     db.refresh(new_request)
 
     return new_request
-# Retrieve a collection request using its tracking ID
 
-@app.get("/requests/{tracking_id}", response_model=CollectionRequestResponse)
+
+@app.get(
+    "/requests/{tracking_id}",
+    response_model=CollectionRequestResponse
+)
 def get_request(
     tracking_id: str,
     db: Session = Depends(get_db),
@@ -178,17 +351,18 @@ def get_request(
             detail="Collection request not found"
         )
 
-    # Only the request owner or an admin can view the details
     if (
         current_user.role != "admin"
         and request.user_id != current_user.id
+        and request.assigned_partner_id != current_user.partner_id
     ):
         raise HTTPException(
             status_code=403,
-            detail="You are not authorized to view this collection request"
+            detail="You are not authorized to view this request"
         )
 
     return request
+
 
 @app.get("/tracking/{tracking_id}")
 def get_tracking_history(
@@ -206,19 +380,21 @@ def get_tracking_history(
             detail="Tracking ID not found"
         )
 
-    # Only the owner or an admin can view tracking history
     if (
         current_user.role != "admin"
         and request.user_id != current_user.id
+        and request.assigned_partner_id != current_user.partner_id
     ):
         raise HTTPException(
             status_code=403,
-            detail="You are not authorized to view this tracking history"
+            detail="You are not authorized to view this history"
         )
 
     history = db.query(TrackingHistory).filter(
         TrackingHistory.tracking_id == tracking_id
-    ).order_by(TrackingHistory.updated_at.asc()).all()
+    ).order_by(
+        TrackingHistory.updated_at.asc()
+    ).all()
 
     return {
         "tracking_id": tracking_id,
@@ -232,7 +408,12 @@ def get_tracking_history(
             for item in history
         ]
     }
-# Register a collection partner
+
+
+# ==========================================
+# PARTNER MANAGEMENT
+# ==========================================
+
 @app.post(
     "/partners",
     response_model=PartnerResponse,
@@ -244,12 +425,14 @@ def create_partner(
 ):
     new_partner = Partner(
         partner_name=partner.partner_name,
+        organisation_type="Local Collection Centre",
         state=partner.state,
         district=partner.district,
         city=partner.city,
         pincode=partner.pincode,
         accepted_categories=partner.accepted_categories,
         capacity=partner.capacity,
+        verification_status="Verified",
         is_active=1,
         is_demo=1
     )
@@ -260,14 +443,16 @@ def create_partner(
 
     return new_partner
 
-# View all collection partners
-@app.get("/partners", response_model=list[PartnerResponse])
+
+@app.get(
+    "/partners",
+    response_model=list[PartnerResponse]
+)
 def get_partners(db: Session = Depends(get_db)):
     return db.query(Partner).filter(
         Partner.is_active == 1
     ).all()
 
-# Recommend suitable collection partners
 
 @app.get("/partners/recommend/{tracking_id}")
 def recommend_partners(
@@ -280,10 +465,19 @@ def recommend_partners(
     ).first()
 
     if not collection:
-        raise HTTPException(status_code=404, detail="Request not found")
+        raise HTTPException(
+            status_code=404,
+            detail="Request not found"
+        )
 
-    if current_user.role not in ["admin"] and collection.user_id != current_user.id:
-        raise HTTPException(status_code=403, detail="Access denied")
+    if (
+        current_user.role != "admin"
+        and collection.user_id != current_user.id
+    ):
+        raise HTTPException(
+            status_code=403,
+            detail="Access denied"
+        )
 
     partners = db.query(Partner).filter(
         Partner.is_active == 1
@@ -292,16 +486,22 @@ def recommend_partners(
     recommendations = []
 
     for partner in partners:
-        # Only verified organisations or clearly labelled demo partners
-        if partner.verification_status != "Verified" and partner.is_demo != 1:
+
+        if (
+            partner.verification_status != "Verified"
+            and partner.is_demo != 1
+        ):
+            continue
+
+        if get_partner_role(partner) != "aggregator":
             continue
 
         if partner.state.strip().lower() != collection.state.strip().lower():
             continue
 
         accepted = [
-            c.strip().lower()
-            for c in partner.accepted_categories.split(",")
+            category.strip().lower()
+            for category in partner.accepted_categories.split(",")
         ]
 
         if collection.device_category.strip().lower() not in accepted:
@@ -349,7 +549,134 @@ def recommend_partners(
         "recommendations": recommendations
     }
 
-# Assign a collection request to a partner
+
+@app.get("/partners")
+def get_all_network_partners(
+    db: Session = Depends(get_db)
+):
+    partners = db.query(Partner).filter(
+        Partner.is_active == 1
+    ).all()
+
+    return [
+        {
+            "id": partner.id,
+            "partner_name": partner.partner_name,
+            "organisation_type": partner.organisation_type,
+            "state": partner.state,
+            "district": partner.district,
+            "city": partner.city,
+            "pincode": partner.pincode,
+            "latitude": partner.latitude,
+            "longitude": partner.longitude,
+            "accepted_categories": partner.accepted_categories,
+            "capacity": partner.capacity,
+            "is_active": partner.is_active,
+            "is_demo": partner.is_demo,
+            "verification_status": partner.verification_status,
+            "partner_role": get_partner_role(partner)
+        }
+        for partner in partners
+        if get_partner_role(partner) in ["aggregator", "recycler"]
+        and (
+            partner.verification_status == "Verified"
+            or partner.is_demo == 1
+        )
+    ]
+
+@app.get("/partners")
+def get_all_network_partners(
+    db: Session = Depends(get_db)
+):
+    partners = db.query(Partner).filter(
+        Partner.is_active == 1
+    ).all()
+
+    return [
+        {
+            "id": partner.id,
+            "partner_name": partner.partner_name,
+            "organisation_type": partner.organisation_type,
+            "state": partner.state,
+            "district": partner.district,
+            "city": partner.city,
+            "pincode": partner.pincode,
+            "latitude": partner.latitude,
+            "longitude": partner.longitude,
+            "accepted_categories": partner.accepted_categories,
+            "capacity": partner.capacity,
+            "is_active": partner.is_active,
+            "is_demo": partner.is_demo,
+            "verification_status": partner.verification_status,
+            "partner_role": get_partner_role(partner)
+        }
+        for partner in partners
+        if get_partner_role(partner) in ["aggregator", "recycler"]
+        and (
+            partner.verification_status == "Verified"
+            or partner.is_demo == 1
+        )
+    ]
+
+
+@app.post("/admin/setup-demo-map-locations")
+def setup_demo_map_locations(
+    db: Session = Depends(get_db)
+):
+    demo_partners = [
+        {
+            "partner_name": "Demo E-Waste Collection Centre",
+            "organisation_type": "aggregator",
+            "state": "Telangana",
+            "district": "Hyderabad",
+            "city": "Hyderabad",
+            "pincode": "500001",
+            "latitude": 17.3850,
+            "longitude": 78.4867,
+            "accepted_categories": "Mobile Phone, Laptop, Television",
+            "capacity": 100
+        },
+        {
+            "partner_name": "WWO Recycler - Demo",
+            "organisation_type": "recycler",
+            "state": "Telangana",
+            "district": "Hyderabad",
+            "city": "Hyderabad",
+            "pincode": "500001",
+            "latitude": 17.4401,
+            "longitude": 78.3489,
+            "accepted_categories": "Laptop, Television",
+            "capacity": 100
+        }
+    ]
+
+    for item in demo_partners:
+        partner = db.query(Partner).filter(
+            Partner.partner_name == item["partner_name"]
+        ).first()
+
+        if not partner:
+            partner = Partner(**item)
+            db.add(partner)
+        else:
+            for key, value in item.items():
+                setattr(partner, key, value)
+
+        partner.is_active = 1
+        partner.is_demo = 1
+        partner.verification_status = "Verified"
+
+    db.commit()
+
+    return {
+        "message": "Demo partners created/updated",
+        "total": 2
+    }
+
+
+# ==========================================
+# ADMIN: SEND COLLECTION OFFER
+# ==========================================
 
 @app.post("/requests/{tracking_id}/offer/{partner_id}")
 def offer_request_to_partner(
@@ -359,17 +686,26 @@ def offer_request_to_partner(
     current_user: User = Depends(get_current_user)
 ):
     if current_user.role != "admin":
-        raise HTTPException(status_code=403, detail="Admin access required")
+        raise HTTPException(
+            status_code=403,
+            detail="Admin access required"
+        )
 
     collection = db.query(DBCollectionRequest).filter(
         DBCollectionRequest.tracking_id == tracking_id
     ).first()
 
     if not collection:
-        raise HTTPException(status_code=404, detail="Request not found")
+        raise HTTPException(
+            status_code=404,
+            detail="Request not found"
+        )
 
     if collection.status not in ["Requested", "Matching"]:
-        raise HTTPException(status_code=400, detail="Request is not available")
+        raise HTTPException(
+            status_code=400,
+            detail="Request is not available"
+        )
 
     partner = db.query(Partner).filter(
         Partner.id == partner_id,
@@ -377,24 +713,48 @@ def offer_request_to_partner(
     ).first()
 
     if not partner:
-        raise HTTPException(status_code=404, detail="Active partner not found")
+        raise HTTPException(
+            status_code=404,
+            detail="Active partner not found"
+        )
 
-    if partner.verification_status != "Verified" and partner.is_demo != 1:
-        raise HTTPException(status_code=400, detail="Partner is not verified")
+    if get_partner_role(partner) != "aggregator":
+        raise HTTPException(
+            status_code=400,
+            detail="Collection offers can only be sent to aggregators"
+        )
+
+    if (
+        partner.verification_status != "Verified"
+        and partner.is_demo != 1
+    ):
+        raise HTTPException(
+            status_code=400,
+            detail="Partner is not verified"
+        )
 
     if partner.state.strip().lower() != collection.state.strip().lower():
-        raise HTTPException(status_code=400, detail="Location mismatch")
+        raise HTTPException(
+            status_code=400,
+            detail="Location mismatch"
+        )
 
     accepted = [
-        c.strip().lower()
-        for c in partner.accepted_categories.split(",")
+        category.strip().lower()
+        for category in partner.accepted_categories.split(",")
     ]
 
     if collection.device_category.strip().lower() not in accepted:
-        raise HTTPException(status_code=400, detail="Device category not accepted")
+        raise HTTPException(
+            status_code=400,
+            detail="Device category not accepted"
+        )
 
     if partner.capacity < collection.quantity:
-        raise HTTPException(status_code=400, detail="Insufficient capacity")
+        raise HTTPException(
+            status_code=400,
+            detail="Insufficient capacity"
+        )
 
     existing = db.query(PartnerOffer).filter(
         PartnerOffer.request_id == collection.id,
@@ -403,7 +763,10 @@ def offer_request_to_partner(
     ).first()
 
     if existing:
-        raise HTTPException(status_code=400, detail="An active offer already exists")
+        raise HTTPException(
+            status_code=400,
+            detail="An active offer already exists"
+        )
 
     offer = PartnerOffer(
         request_id=collection.id,
@@ -414,14 +777,14 @@ def offer_request_to_partner(
 
     db.add(offer)
 
-    db.add(TrackingHistory(
-        tracking_id=tracking_id,
-        status="Offer Sent",
-        remarks=f"Collection offer sent to {partner.partner_name}",
-        actor_id=current_user.id,
-        actor_role="admin",
-        partner_id=partner.id
-    ))
+    add_history(
+        db,
+        tracking_id,
+        "Offer Sent",
+        f"Collection offer sent to {partner.partner_name}",
+        current_user,
+        partner.id
+    )
 
     db.commit()
 
@@ -432,57 +795,15 @@ def offer_request_to_partner(
         "offer_status": "Offered"
     }
 
-# Update collection request status
-@app.put("/requests/{tracking_id}/status")
-def update_request_status(
-    tracking_id: str,
-    update: StatusUpdate,
-    db: Session = Depends(get_db)
-):
-    request = db.query(DBCollectionRequest).filter(
-        DBCollectionRequest.tracking_id == tracking_id
-    ).first()
 
-    if not request:
-        raise HTTPException(
-            status_code=404,
-            detail="Collection request not found"
-        )
+# ==========================================
+# PARTNER APPLICATIONS
+# ==========================================
 
-    allowed_transitions = {
-        "Requested": "Assigned",
-        "Assigned": "Scheduled",
-        "Scheduled": "Collected",
-        "Collected": "Received"
-    }
-
-    expected_status = allowed_transitions.get(request.status)
-
-    if update.status != expected_status:
-        raise HTTPException(
-            status_code=400,
-            detail=f"Invalid status transition. Expected: {expected_status}"
-        )
-
-    request.status = update.status
-
-    history_entry = TrackingHistory(
-        tracking_id=tracking_id,
-        status=update.status,
-        remarks=update.remarks
-    )
-
-    db.add(history_entry)
-    db.commit()
-    db.refresh(request)
-
-    return {
-        "message": "Status updated successfully",
-        "tracking_id": tracking_id,
-        "current_status": request.status
-    }
-
-@app.post("/partner-applications", response_model=PartnerApplicationResponse)
+@app.post(
+    "/partner-applications",
+    response_model=PartnerApplicationResponse
+)
 def submit_partner_application(
     application: PartnerApplicationCreate,
     db: Session = Depends(get_db)
@@ -491,7 +812,7 @@ def submit_partner_application(
         organisation_name=application.organisation_name,
         contact_person=application.contact_person,
         phone=application.phone,
-        email=application.email,
+        email=application.email.strip().lower(),
         state=application.state,
         district=application.district,
         city=application.city,
@@ -502,6 +823,7 @@ def submit_partner_application(
         capacity=application.capacity,
         organisation_type=application.organisation_type,
         authorization_details=application.authorization_details,
+        registration_number=application.registration_number,
         status="Pending Verification"
     )
 
@@ -510,9 +832,6 @@ def submit_partner_application(
     db.refresh(new_application)
 
     return new_application
-UPLOAD_DIR = Path("uploads/partner_documents")
-UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
-
 
 @app.post("/partner-applications/{application_id}/upload-document")
 async def upload_partner_document(
@@ -575,22 +894,33 @@ async def upload_partner_document(
         "document_filename": file.filename,
         "status": application.status
     }
+
+
+# ==========================================
+# ADMIN: VERIFY ORGANISATIONS
+# ==========================================
+
 @app.get(
     "/admin/partner-applications",
     dependencies=[Depends(verify_admin)]
 )
-def get_partner_applications(db: Session = Depends(get_db)):
-    applications = db.query(PartnerApplication).order_by(
+def get_partner_applications(
+    db: Session = Depends(get_db)
+):
+    return db.query(PartnerApplication).order_by(
         PartnerApplication.created_at.desc()
     ).all()
 
-    return applications
 
 @app.post(
     "/admin/partner-applications/{application_id}/approve",
     dependencies=[Depends(verify_admin)]
 )
 
+@app.post(
+    "/admin/partner-applications/{application_id}/approve",
+    dependencies=[Depends(verify_admin)]
+)
 def approve_partner_application(
     application_id: int,
     notes: str,
@@ -601,12 +931,21 @@ def approve_partner_application(
     ).first()
 
     if not application:
-        raise HTTPException(status_code=404, detail="Application not found")
+        raise HTTPException(
+            status_code=404,
+            detail="Application not found"
+        )
 
     if application.status != "Pending Verification":
-        raise HTTPException(status_code=400, detail="Application already reviewed")
+        raise HTTPException(
+            status_code=400,
+            detail="Application already reviewed"
+        )
 
-    if not application.document_path or not Path(application.document_path).is_file():
+    if (
+        not application.document_path
+        or not Path(application.document_path).is_file()
+    ):
         raise HTTPException(
             status_code=400,
             detail="A valid supporting document is required"
@@ -618,7 +957,6 @@ def approve_partner_application(
             detail="Provide at least 20 characters of verification notes"
         )
 
-    # Prevent duplicate login accounts
     existing_user = db.query(User).filter(
         User.email == application.email
     ).first()
@@ -629,39 +967,48 @@ def approve_partner_application(
             detail="An account with this email already exists"
         )
 
-    # Create the organisation's partner record
     new_partner = Partner(
-    partner_name=application.organisation_name,
-    organisation_type=application.organisation_type,
-    state=application.state,
-    district=application.district,
-    city=application.city,
-    pincode=application.pincode,
-    accepted_categories=application.accepted_categories,
-    capacity=application.capacity,
-    verification_status="Verified",
-    registration_number=application.registration_number,
-    authorization_details=application.authorization_details,
-    verification_notes=notes,
-    verified_at=datetime.now(timezone.utc),
-    is_active=1,
-    is_demo=0,
-    latitude=application.latitude,
-    longitude=application.longitude,
-)
+        partner_name=application.organisation_name,
+        organisation_type=application.organisation_type,
+        state=application.state,
+        district=application.district,
+        city=application.city,
+        pincode=application.pincode,
+        accepted_categories=application.accepted_categories,
+        capacity=application.capacity,
+        verification_status="Verified",
+        registration_number=application.registration_number,
+        authorization_details=application.authorization_details,
+        verification_notes=notes.strip(),
+        verified_at=datetime.now(timezone.utc),
+        is_active=1,
+        is_demo=0,
+        latitude=application.latitude,
+        longitude=application.longitude
+    )
+
+    organisation_role = get_partner_role(new_partner)
+
+    if organisation_role is None:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                "Organisation type is unclear. "
+                "Verify and classify it as an aggregator or recycler "
+                "before approval."
+            )
+        )
 
     db.add(new_partner)
     db.flush()
 
-    # Generate a unique temporary login password
     temporary_password = secrets.token_urlsafe(12)
 
-    # Create the linked partner login
     partner_user = User(
         full_name=application.contact_person,
         email=application.email,
         password_hash=password_hasher.hash(temporary_password),
-        role="partner",
+        role=organisation_role,
         partner_id=new_partner.id,
         is_active=1
     )
@@ -670,14 +1017,72 @@ def approve_partner_application(
 
     application.status = "Approved"
     application.verification_notes = notes.strip()
-    application.verified_at = datetime.utcnow()
+    application.verified_at = datetime.now(timezone.utc)
 
     db.commit()
 
     return {
-        "message": "Partner application approved and account created",
+        "message": "Organisation application approved and account created",
         "application_id": application.id,
         "partner_id": new_partner.id,
+        "organisation_role": organisation_role,
+        "email": partner_user.email,
+        "temporary_password": temporary_password
+    }
+
+@app.post(
+    "/admin/partner-applications/{application_id}/regenerate-credentials",
+    dependencies=[Depends(verify_admin)]
+)
+def regenerate_organisation_credentials(
+    application_id: int,
+    db: Session = Depends(get_db)
+):
+    application = db.query(PartnerApplication).filter(
+        PartnerApplication.id == application_id
+    ).first()
+
+    if not application:
+        raise HTTPException(
+            status_code=404,
+            detail="Application not found"
+        )
+
+    if application.status != "Approved":
+        raise HTTPException(
+            status_code=400,
+            detail="Only approved organisations can receive login credentials"
+        )
+
+    partner_user = db.query(User).filter(
+        User.email == application.email.strip().lower()
+    ).first()
+
+    if not partner_user or not partner_user.partner_id:
+        raise HTTPException(
+            status_code=404,
+            detail="Organisation account not found"
+        )
+
+    if partner_user.role not in ["aggregator", "recycler"]:
+        raise HTTPException(
+            status_code=400,
+            detail="This account is not an organisation account"
+        )
+
+    temporary_password = secrets.token_urlsafe(12)
+
+    partner_user.password_hash = password_hasher.hash(
+        temporary_password
+    )
+
+    db.commit()
+
+    return {
+        "message": "Organisation credentials regenerated successfully",
+        "application_id": application.id,
+        "partner_id": partner_user.partner_id,
+        "organisation_role": partner_user.role,
         "email": partner_user.email,
         "temporary_password": temporary_password
     }
@@ -696,14 +1101,20 @@ def reject_partner_application(
     ).first()
 
     if not application:
-        raise HTTPException(status_code=404, detail="Application not found")
+        raise HTTPException(
+            status_code=404,
+            detail="Application not found"
+        )
 
     if application.status != "Pending Verification":
-        raise HTTPException(status_code=400, detail="Application already reviewed")
+        raise HTTPException(
+            status_code=400,
+            detail="Application already reviewed"
+        )
 
     application.status = "Rejected"
     application.verification_notes = reason
-    application.verified_at = datetime.utcnow()
+    application.verified_at = datetime.now(timezone.utc)
 
     db.commit()
 
@@ -713,6 +1124,8 @@ def reject_partner_application(
         "status": application.status,
         "reason": reason
     }
+
+
 @app.get(
     "/admin/partner-applications/{application_id}/document",
     dependencies=[Depends(verify_admin)]
@@ -744,32 +1157,10 @@ def view_partner_document(
         filename=application.document_filename
     )
 
-def create_access_token(user: User):
-    if not JWT_SECRET_KEY:
-        raise HTTPException(
-            status_code=500,
-            detail="JWT secret is not configured"
-        )
 
-    payload = {
-        "sub": str(user.id),
-        "role": user.role,
-        "exp": datetime.now(timezone.utc) + timedelta(
-            minutes=ACCESS_TOKEN_EXPIRE_MINUTES
-        )
-    }
-
-    return jwt.encode(
-        payload,
-        JWT_SECRET_KEY,
-        algorithm=JWT_ALGORITHM
-    )
-
-
-bearer_scheme = HTTPBearer()
-
-
-
+# ==========================================
+# USER REGISTRATION AND LOGIN
+# ==========================================
 
 @app.post("/auth/register", response_model=AuthResponse)
 def register_user(
@@ -806,10 +1197,8 @@ def register_user(
     db.commit()
     db.refresh(new_user)
 
-    token = create_access_token(new_user)
-
     return {
-        "access_token": token,
+        "access_token": create_access_token(new_user),
         "token_type": "bearer",
         "role": new_user.role,
         "full_name": new_user.full_name
@@ -842,10 +1231,8 @@ def login_user(
             detail="Your account is inactive"
         )
 
-    token = create_access_token(user)
-
     return {
-        "access_token": token,
+        "access_token": create_access_token(user),
         "token_type": "bearer",
         "role": user.role,
         "full_name": user.full_name
@@ -854,29 +1241,94 @@ def login_user(
 
 @app.get("/auth/me")
 def get_my_account(
-    current_user: User = Depends(get_current_user)
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db)
 ):
     return {
-    "access_token": token,
-    "token_type": "bearer",
-    "role": user.role,
-    "full_name": user.full_name,
-    "partner_id": user.partner_id
-}
+        "id": current_user.id,
+        "full_name": current_user.full_name,
+        "email": current_user.email,
+        "role": current_user.role,
+        "partner_id": current_user.partner_id
+    }
 
-@app.get("/partner/requests")
-def get_partner_requests(
+
+# ==========================================
+# AGGREGATOR: COLLECTION REQUESTS
+# ==========================================
+
+@app.get("/aggregator/requests")
+def get_aggregator_requests(
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user)
 ):
-    if current_user.role != "partner" or not current_user.partner_id:
-        raise HTTPException(status_code=403, detail="Partner access required")
+    partner = require_organisation_role(
+        current_user,
+        db,
+        "aggregator"
+    )
 
-    offers = db.query(PartnerOffer, DBCollectionRequest).join(
+    offers = db.query(
+        PartnerOffer,
+        DBCollectionRequest
+    ).join(
         DBCollectionRequest,
         PartnerOffer.request_id == DBCollectionRequest.id
     ).filter(
-        PartnerOffer.partner_id == current_user.partner_id
+        PartnerOffer.partner_id == partner.id
+    ).order_by(
+        PartnerOffer.offered_at.desc()
+    ).all()
+
+    results = []
+
+    for offer, collection in offers:
+        results.append({
+            "id": collection.id,
+            "offer_id": offer.id,
+            "tracking_id": collection.tracking_id,
+            "requester_name": collection.requester_name,
+            "device_category": collection.device_category,
+            "quantity": collection.quantity,
+            "condition": collection.condition,
+            "state": collection.state,
+            "district": collection.district,
+            "city": collection.city,
+            "pincode": collection.pincode,
+            "status": collection.status,
+            "offer_status": offer.status,
+            "assigned_collector_id": collection.assigned_collector_id,
+            "collected_quantity": collection.collected_quantity,
+            "collected_weight": collection.collected_weight,
+            "created_at": collection.created_at
+        })
+
+    return {
+        "total_requests": len(results),
+        "requests": results
+    }
+
+
+# Keep the old partner endpoint working for existing frontend versions.
+@app.get("/partner/requests")
+def get_legacy_partner_requests(
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user)
+):
+    partner = require_organisation_role(
+        current_user,
+        db,
+        "aggregator"
+    )
+
+    offers = db.query(
+        PartnerOffer,
+        DBCollectionRequest
+    ).join(
+        DBCollectionRequest,
+        PartnerOffer.request_id == DBCollectionRequest.id
+    ).filter(
+        PartnerOffer.partner_id == partner.id
     ).order_by(
         PartnerOffer.offered_at.desc()
     ).all()
@@ -907,79 +1359,1017 @@ def get_partner_requests(
     }
 
 
-@app.post("/partner/offers/{offer_id}/respond")
-def respond_to_offer(
+@app.post("/aggregator/offers/{offer_id}/respond")
+def aggregator_respond_to_offer(
     offer_id: int,
     decision: str,
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user)
 ):
-    if current_user.role != "partner" or not current_user.partner_id:
-        raise HTTPException(status_code=403, detail="Partner access required")
+    partner = require_organisation_role(
+        current_user,
+        db,
+        "aggregator"
+    )
 
-    if decision.lower() not in ["accept", "decline"]:
-        raise HTTPException(status_code=400, detail="Decision must be accept or decline")
+    decision = decision.lower().strip()
+
+    if decision not in ["accept", "decline"]:
+        raise HTTPException(
+            status_code=400,
+            detail="Decision must be accept or decline"
+        )
 
     offer = db.query(PartnerOffer).filter(
         PartnerOffer.id == offer_id,
-        PartnerOffer.partner_id == current_user.partner_id
+        PartnerOffer.partner_id == partner.id
     ).first()
 
     if not offer:
-        raise HTTPException(status_code=404, detail="Offer not found")
+        raise HTTPException(
+            status_code=404,
+            detail="Offer not found"
+        )
 
     if offer.status != "Offered":
-        raise HTTPException(status_code=400, detail="Offer already responded to")
+        raise HTTPException(
+            status_code=400,
+            detail="Offer already responded to"
+        )
 
     collection = db.query(DBCollectionRequest).filter(
         DBCollectionRequest.id == offer.request_id
     ).first()
 
     if not collection:
-        raise HTTPException(status_code=404, detail="Collection request not found")
+        raise HTTPException(
+            status_code=404,
+            detail="Collection request not found"
+        )
 
-    partner = db.query(Partner).filter(
-        Partner.id == current_user.partner_id,
-        Partner.is_active == 1
-    ).first()
+    if decision == "accept":
 
-    if not partner:
-        raise HTTPException(status_code=403, detail="Partner account inactive")
-
-    if decision.lower() == "accept":
         if collection.assigned_partner_id is not None:
-            raise HTTPException(status_code=409, detail="Request already accepted by another partner")
+            raise HTTPException(
+                status_code=409,
+                detail="Request already assigned to another partner"
+            )
 
         if partner.capacity < collection.quantity:
-            raise HTTPException(status_code=400, detail="Insufficient partner capacity")
+            raise HTTPException(
+                status_code=400,
+                detail="Insufficient partner capacity"
+            )
 
         offer.status = "Accepted"
+
         collection.assigned_partner_id = partner.id
         collection.assigned_partner = partner.partner_name
         collection.status = "Accepted"
 
-        history_status = "Partner Accepted"
+        history_status = "Aggregator Accepted"
 
     else:
         offer.status = "Declined"
-        history_status = "Partner Declined"
+        history_status = "Aggregator Declined"
 
     offer.responded_at = datetime.now(timezone.utc)
 
-    db.add(TrackingHistory(
-        tracking_id=collection.tracking_id,
-        status=history_status,
-        remarks=f"{partner.partner_name} {decision.lower()}ed the collection offer",
-        actor_id=current_user.id,
-        actor_role="partner",
-        partner_id=partner.id
-    ))
+    add_history(
+        db,
+        collection.tracking_id,
+        history_status,
+        f"{partner.partner_name} {decision}ed the collection offer",
+        current_user,
+        partner.id
+    )
 
     db.commit()
 
     return {
-        "message": f"Offer {decision.lower()}ed successfully",
+        "message": f"Offer {decision}ed successfully",
         "offer_id": offer.id,
         "offer_status": offer.status,
         "tracking_id": collection.tracking_id
+    }
+
+
+# Legacy endpoint retained for existing partner frontend.
+@app.post("/partner/offers/{offer_id}/respond")
+def legacy_partner_respond(
+    offer_id: int,
+    decision: str,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user)
+):
+    return aggregator_respond_to_offer(
+        offer_id,
+        decision,
+        db,
+        current_user
+    )
+
+
+# ==========================================
+# AGGREGATOR: COLLECTOR MANAGEMENT
+# ==========================================
+
+@app.post(
+    "/aggregator/collectors",
+    response_model=CollectorResponse
+)
+def create_collector(
+    data: CollectorCreate,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user)
+):
+    partner = require_organisation_role(
+        current_user,
+        db,
+        "aggregator"
+    )
+
+    collector = Collector(
+        aggregator_id=partner.id,
+        full_name=data.full_name.strip(),
+        phone=data.phone.strip(),
+        service_area=data.service_area,
+        preferred_language=data.preferred_language,
+        is_active=1
+    )
+
+    db.add(collector)
+    db.commit()
+    db.refresh(collector)
+
+    return collector
+
+
+@app.get(
+    "/aggregator/collectors",
+    response_model=list[CollectorResponse]
+)
+def get_collectors(
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user)
+):
+    partner = require_organisation_role(
+        current_user,
+        db,
+        "aggregator"
+    )
+
+    return db.query(Collector).filter(
+        Collector.aggregator_id == partner.id
+    ).order_by(
+        Collector.created_at.desc()
+    ).all()
+
+
+@app.put("/aggregator/requests/{tracking_id}/assign-collector")
+def assign_collector(
+    tracking_id: str,
+    assignment: CollectorAssignment,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user)
+):
+    partner = require_organisation_role(
+        current_user,
+        db,
+        "aggregator"
+    )
+
+    collection = db.query(DBCollectionRequest).filter(
+        DBCollectionRequest.tracking_id == tracking_id,
+        DBCollectionRequest.assigned_partner_id == partner.id
+    ).first()
+
+    if not collection:
+        raise HTTPException(
+            status_code=404,
+            detail="Assigned collection request not found"
+        )
+
+    if collection.status not in ["Accepted", "Assigned"]:
+        raise HTTPException(
+            status_code=400,
+            detail="Request is not ready for collector assignment"
+        )
+
+    collector = db.query(Collector).filter(
+        Collector.id == assignment.collector_id,
+        Collector.aggregator_id == partner.id,
+        Collector.is_active == 1
+    ).first()
+
+    if not collector:
+        raise HTTPException(
+            status_code=404,
+            detail="Active collector not found under your organisation"
+        )
+
+    collection.assigned_collector_id = collector.id
+    collection.status = "Scheduled"
+
+    add_history(
+        db,
+        tracking_id,
+        "Scheduled",
+        f"Pickup assigned to collector {collector.full_name}",
+        current_user,
+        partner.id
+    )
+
+    db.commit()
+
+    return {
+        "message": "Collector assigned successfully",
+        "tracking_id": tracking_id,
+        "collector_id": collector.id,
+        "collector_name": collector.full_name,
+        "status": collection.status
+    }
+
+
+# ==========================================
+# AGGREGATOR: RECORD PHYSICAL COLLECTION
+# ==========================================
+
+@app.post("/aggregator/requests/{tracking_id}/record-pickup")
+def record_pickup(
+    tracking_id: str,
+    record: CollectionRecord,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user)
+):
+    partner = require_organisation_role(
+        current_user,
+        db,
+        "aggregator"
+    )
+
+    collection = db.query(DBCollectionRequest).filter(
+        DBCollectionRequest.tracking_id == tracking_id,
+        DBCollectionRequest.assigned_partner_id == partner.id
+    ).first()
+
+    if not collection:
+        raise HTTPException(
+            status_code=404,
+            detail="Collection request not found"
+        )
+
+    if collection.status != "Scheduled":
+        raise HTTPException(
+            status_code=400,
+            detail="A scheduled pickup is required before recording collection"
+        )
+
+    if not collection.assigned_collector_id:
+        raise HTTPException(
+            status_code=400,
+            detail="Assign a collector before recording pickup"
+        )
+
+    collector = db.query(Collector).filter(
+        Collector.id == collection.assigned_collector_id,
+        Collector.aggregator_id == partner.id
+    ).first()
+
+    if not collector:
+        raise HTTPException(
+            status_code=400,
+            detail="Assigned collector record is unavailable"
+        )
+
+    collection.collected_quantity = record.collected_quantity
+    collection.collected_weight = record.collected_weight
+    collection.collected_at = datetime.now(timezone.utc)
+    collection.status = "Collected"
+
+    remarks = (
+        f"Pickup recorded by aggregator. "
+        f"Collector: {collector.full_name}. "
+        f"Actual quantity: {record.collected_quantity}."
+    )
+
+    if record.collected_weight is not None:
+        remarks += f" Actual weight: {record.collected_weight} kg."
+
+    if record.remarks:
+        remarks += f" Notes: {record.remarks}"
+
+    add_history(
+        db,
+        tracking_id,
+        "Collected",
+        remarks,
+        current_user,
+        partner.id
+    )
+
+    db.commit()
+
+    return {
+        "message": "Collection recorded successfully",
+        "tracking_id": tracking_id,
+        "collected_quantity": collection.collected_quantity,
+        "collected_weight": collection.collected_weight,
+        "status": collection.status
+    }
+
+
+# ==========================================
+# AGGREGATOR: MATERIAL BATCHES
+# ==========================================
+
+@app.post(
+    "/aggregator/batches",
+    response_model=MaterialBatchResponse
+)
+def create_material_batch(
+    data: MaterialBatchCreate,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user)
+):
+    partner = require_organisation_role(
+        current_user,
+        db,
+        "aggregator"
+    )
+
+    if len(set(data.request_ids)) != len(data.request_ids):
+        raise HTTPException(
+            status_code=400,
+            detail="Duplicate request IDs are not allowed"
+        )
+
+    collections = db.query(DBCollectionRequest).filter(
+        DBCollectionRequest.id.in_(data.request_ids),
+        DBCollectionRequest.assigned_partner_id == partner.id,
+        DBCollectionRequest.status == "Collected"
+    ).all()
+
+    if len(collections) != len(data.request_ids):
+        raise HTTPException(
+            status_code=400,
+            detail="Every request must belong to your organisation and be collected"
+        )
+
+    existing_items = db.query(MaterialBatchItem).filter(
+        MaterialBatchItem.request_id.in_(data.request_ids)
+    ).first()
+
+    if existing_items:
+        raise HTTPException(
+            status_code=409,
+            detail="One or more requests already belong to a material batch"
+        )
+
+    for collection in collections:
+        if (
+            collection.device_category.strip().lower()
+            != data.material_category.strip().lower()
+        ):
+            raise HTTPException(
+                status_code=400,
+                detail="All requests in a batch must have the selected material category"
+            )
+
+    total_quantity = sum(
+        collection.collected_quantity or collection.quantity
+        for collection in collections
+    )
+
+    weights = [
+        collection.collected_weight
+        for collection in collections
+        if collection.collected_weight is not None
+    ]
+
+    total_weight = sum(weights) if weights else None
+
+    batch = MaterialBatch(
+        batch_code=f"ECVB-{uuid4().hex[:10].upper()}",
+        aggregator_id=partner.id,
+        material_category=data.material_category,
+        total_quantity=total_quantity,
+        total_weight=total_weight,
+        status="Preparing"
+    )
+
+    db.add(batch)
+    db.flush()
+
+    for collection in collections:
+        db.add(
+            MaterialBatchItem(
+                batch_id=batch.id,
+                request_id=collection.id,
+                quantity=collection.collected_quantity or collection.quantity,
+                weight=collection.collected_weight
+            )
+        )
+
+        add_history(
+            db,
+            collection.tracking_id,
+            "Batched",
+            f"Material added to batch {batch.batch_code}",
+            current_user,
+            partner.id
+        )
+
+    db.commit()
+    db.refresh(batch)
+
+    return batch
+
+
+@app.get(
+    "/aggregator/batches",
+    response_model=list[MaterialBatchResponse]
+)
+def get_aggregator_batches(
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user)
+):
+    partner = require_organisation_role(
+        current_user,
+        db,
+        "aggregator"
+    )
+
+    return db.query(MaterialBatch).filter(
+        MaterialBatch.aggregator_id == partner.id
+    ).order_by(
+        MaterialBatch.created_at.desc()
+    ).all()
+
+
+# ==========================================
+# AGGREGATOR: HANDOVER TO RECYCLER
+# ==========================================
+
+@app.post(
+    "/aggregator/batches/{batch_id}/handover",
+    response_model=BatchHandoverResponse
+)
+
+@app.post(
+    "/aggregator/batches/{batch_id}/handover",
+    response_model=BatchHandoverResponse
+)
+def create_batch_handover(
+    batch_id: int,
+    data: BatchHandoverCreate,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user)
+):
+    partner = require_organisation_role(
+        current_user,
+        db,
+        "aggregator"
+    )
+
+    batch = db.query(MaterialBatch).filter(
+        MaterialBatch.id == batch_id,
+        MaterialBatch.aggregator_id == partner.id
+    ).first()
+
+    if not batch:
+        raise HTTPException(
+            status_code=404,
+            detail="Material batch not found"
+        )
+
+    if batch.status not in ["Preparing", "Ready"]:
+        raise HTTPException(
+            status_code=400,
+            detail="This batch is not available for handover"
+        )
+
+    recycler = db.query(Partner).filter(
+        Partner.id == data.recycler_id,
+        Partner.is_active == 1,
+        Partner.verification_status == "Verified"
+    ).first()
+
+    if not recycler or get_partner_role(recycler) != "recycler":
+        raise HTTPException(
+            status_code=404,
+            detail="Verified recycler not found"
+        )
+
+    accepted = [
+        category.strip().lower()
+        for category in recycler.accepted_categories.split(",")
+    ]
+
+    if batch.material_category.strip().lower() not in accepted:
+        raise HTTPException(
+            status_code=400,
+            detail="Recycler does not list this material category"
+        )
+
+    selected_offer = None
+
+    if data.price_offer_id is not None:
+        selected_offer = db.query(RecyclerPriceOffer).filter(
+            RecyclerPriceOffer.id == data.price_offer_id,
+            RecyclerPriceOffer.recycler_id == recycler.id,
+            RecyclerPriceOffer.status == "Active"
+        ).first()
+
+        if not selected_offer:
+            raise HTTPException(
+                status_code=404,
+                detail="Selected recycler price offer not found or inactive"
+            )
+
+        if (
+            selected_offer.material_category.strip().lower()
+            != batch.material_category.strip().lower()
+        ):
+            raise HTTPException(
+                status_code=400,
+                detail="Selected offer does not match the batch category"
+            )
+
+        if selected_offer.valid_until:
+            expiry = selected_offer.valid_until
+
+            if expiry.tzinfo is None:
+                expiry = expiry.replace(tzinfo=timezone.utc)
+
+            if expiry <= datetime.now(timezone.utc):
+                raise HTTPException(
+                    status_code=400,
+                    detail="Selected price offer has expired"
+                )
+
+        if batch.total_weight is None or batch.total_weight <= 0:
+            raise HTTPException(
+                status_code=400,
+                detail="Record the batch weight before selecting a price offer"
+            )
+
+        if (
+            selected_offer.minimum_quantity_kg is not None
+            and float(batch.total_weight)
+            < float(selected_offer.minimum_quantity_kg)
+        ):
+            raise HTTPException(
+                status_code=400,
+                detail="Batch weight is below the offer's minimum quantity"
+            )
+
+    agreed_price = (
+        selected_offer.price_per_kg
+        if selected_offer else None
+    )
+
+    estimated_amount = (
+        round(
+            float(batch.total_weight) * float(agreed_price),
+            2
+        )
+        if agreed_price is not None else None
+    )
+
+    existing = db.query(BatchHandover).filter(
+        BatchHandover.batch_id == batch.id,
+        BatchHandover.status.in_(["Dispatched", "Received"])
+    ).first()
+
+    if existing:
+        raise HTTPException(
+            status_code=409,
+            detail="This batch already has an active or completed handover"
+        )
+
+    handover = BatchHandover(
+        batch_id=batch.id,
+        aggregator_id=partner.id,
+        recycler_id=recycler.id,
+        price_offer_id=(
+            selected_offer.id if selected_offer else None
+        ),
+        agreed_price_per_kg=agreed_price,
+        estimated_amount=estimated_amount,
+        status="Dispatched",
+        dispatched_weight=batch.total_weight,
+        dispatched_at=datetime.now(timezone.utc),
+        remarks=data.remarks
+    )
+
+    batch.status = "Dispatched"
+
+    db.add(handover)
+    db.commit()
+    db.refresh(handover)
+
+    return handover
+
+# ==========================================
+# RECYCLER: PRICE OFFERS
+# ==========================================
+
+@app.post(
+    "/recycler/price-offers",
+    response_model=RecyclerPriceOfferResponse
+)
+def create_recycler_price_offer(
+    data: RecyclerPriceOfferCreate,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user)
+):
+    recycler = require_organisation_role(
+        current_user,
+        db,
+        "recycler"
+    )
+
+    if recycler.verification_status != "Verified":
+        raise HTTPException(
+            status_code=403,
+            detail="Only verified recyclers can publish price offers"
+        )
+
+    accepted = [
+        category.strip().lower()
+        for category in recycler.accepted_categories.split(",")
+    ]
+
+    if data.material_category.strip().lower() not in accepted:
+        raise HTTPException(
+            status_code=400,
+            detail="You do not accept this material category"
+        )
+
+    if data.valid_until:
+        expiry = data.valid_until
+
+        if expiry.tzinfo is None:
+            expiry = expiry.replace(tzinfo=timezone.utc)
+
+        if expiry <= datetime.now(timezone.utc):
+            raise HTTPException(
+                status_code=400,
+                detail="Offer validity must be in the future"
+            )
+
+    price_offer = RecyclerPriceOffer(
+        recycler_id=recycler.id,
+        material_category=data.material_category.strip(),
+        price_per_kg=data.price_per_kg,
+        minimum_quantity_kg=data.minimum_quantity_kg,
+        valid_until=data.valid_until,
+        status="Active"
+    )
+
+    db.add(price_offer)
+    db.commit()
+    db.refresh(price_offer)
+
+    return price_offer
+
+
+@app.get(
+    "/recycler/price-offers",
+    response_model=list[RecyclerPriceOfferResponse]
+)
+def get_recycler_price_offers(
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user)
+):
+    recycler = require_organisation_role(
+        current_user,
+        db,
+        "recycler"
+    )
+
+    return db.query(RecyclerPriceOffer).filter(
+        RecyclerPriceOffer.recycler_id == recycler.id
+    ).order_by(
+        RecyclerPriceOffer.created_at.desc()
+    ).all()
+
+
+@app.get("/aggregator/batches/{batch_id}/price-offers")
+def get_batch_price_offers(
+    batch_id: int,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user)
+):
+    aggregator = require_organisation_role(
+        current_user,
+        db,
+        "aggregator"
+    )
+
+    batch = db.query(MaterialBatch).filter(
+        MaterialBatch.id == batch_id,
+        MaterialBatch.aggregator_id == aggregator.id
+    ).first()
+
+    if not batch:
+        raise HTTPException(
+            status_code=404,
+            detail="Material batch not found"
+        )
+
+    if batch.total_weight is None or batch.total_weight <= 0:
+        raise HTTPException(
+            status_code=400,
+            detail="Record the batch weight before comparing price offers"
+        )
+
+    now = datetime.now(timezone.utc)
+
+    offers = db.query(
+        RecyclerPriceOffer,
+        Partner
+    ).join(
+        Partner,
+        RecyclerPriceOffer.recycler_id == Partner.id
+    ).filter(
+        RecyclerPriceOffer.status == "Active",
+        Partner.is_active == 1,
+        Partner.verification_status == "Verified",
+        RecyclerPriceOffer.material_category.ilike(
+            batch.material_category.strip()
+        )
+    ).all()
+
+    results = []
+
+    for offer, recycler in offers:
+
+        if get_partner_role(recycler) != "recycler":
+            continue
+
+        if offer.valid_until:
+            expiry = offer.valid_until
+
+            if expiry.tzinfo is None:
+                expiry = expiry.replace(tzinfo=timezone.utc)
+
+            if expiry <= now:
+                continue
+
+        if (
+            offer.minimum_quantity_kg is not None
+            and batch.total_weight < float(offer.minimum_quantity_kg)
+        ):
+            continue
+
+        estimated_value = (
+            float(batch.total_weight) * float(offer.price_per_kg)
+        )
+
+        results.append({
+            "offer_id": offer.id,
+            "recycler_id": recycler.id,
+            "recycler_name": recycler.partner_name,
+            "city": recycler.city,
+            "material_category": offer.material_category,
+            "price_per_kg": float(offer.price_per_kg),
+            "minimum_quantity_kg": (
+                float(offer.minimum_quantity_kg)
+                if offer.minimum_quantity_kg is not None
+                else None
+            ),
+            "batch_weight_kg": float(batch.total_weight),
+            "estimated_value": round(estimated_value, 2),
+            "valid_until": offer.valid_until
+        })
+
+    results.sort(
+        key=lambda item: item["price_per_kg"],
+        reverse=True
+    )
+
+    return {
+        "batch_id": batch.id,
+        "batch_code": batch.batch_code,
+        "material_category": batch.material_category,
+        "total_weight_kg": float(batch.total_weight),
+        "total_offers": len(results),
+        "offers": results
+    }
+# ==========================================
+# RECYCLER: INCOMING HANDOVERS
+# ==========================================
+
+@app.get(
+    "/recycler/handovers",
+    response_model=list[BatchHandoverResponse]
+)
+def get_recycler_handovers(
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user)
+):
+    partner = require_organisation_role(
+        current_user,
+        db,
+        "recycler"
+    )
+
+    return db.query(BatchHandover).filter(
+        BatchHandover.recycler_id == partner.id
+    ).order_by(
+        BatchHandover.created_at.desc()
+    ).all()
+
+
+@app.post("/recycler/handovers/{handover_id}/respond")
+def respond_to_handover(
+    handover_id: int,
+    decision: HandoverDecision,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user)
+):
+    partner = require_organisation_role(
+        current_user,
+        db,
+        "recycler"
+    )
+
+    action = decision.decision.strip().lower()
+
+    if action not in ["accept", "reject"]:
+        raise HTTPException(
+            status_code=400,
+            detail="Decision must be accept or reject"
+        )
+
+    handover = db.query(BatchHandover).filter(
+        BatchHandover.id == handover_id,
+        BatchHandover.recycler_id == partner.id
+    ).first()
+
+    if not handover:
+        raise HTTPException(
+            status_code=404,
+            detail="Handover not found"
+        )
+
+    if handover.status != "Dispatched":
+        raise HTTPException(
+            status_code=400,
+            detail="This handover has already been processed"
+        )
+
+    batch = db.query(MaterialBatch).filter(
+        MaterialBatch.id == handover.batch_id
+    ).first()
+
+    if action == "accept":
+
+        if decision.received_weight is None:
+            raise HTTPException(
+                status_code=400,
+                detail="Enter the actual received weight"
+            )
+
+        handover.status = "Received"
+        handover.received_weight = decision.received_weight
+        handover.received_at = datetime.now(timezone.utc)
+
+        if decision.remarks:
+            handover.remarks = decision.remarks
+
+        if batch:
+            batch.status = "Received"
+
+        items = db.query(MaterialBatchItem).filter(
+            MaterialBatchItem.batch_id == handover.batch_id
+        ).all()
+
+        for item in items:
+            collection = db.query(DBCollectionRequest).filter(
+                DBCollectionRequest.id == item.request_id
+            ).first()
+
+            if collection:
+                collection.status = "Received"
+
+                add_history(
+                    db,
+                    collection.tracking_id,
+                    "Received",
+                    (
+                        f"Recycler {partner.partner_name} confirmed "
+                        f"receipt through batch {batch.batch_code if batch else handover.batch_id}. "
+                        f"Received weight: {decision.received_weight} kg."
+                    ),
+                    current_user,
+                    partner.id
+                )
+
+    else:
+        handover.status = "Rejected"
+
+        if decision.remarks:
+            handover.remarks = decision.remarks
+
+        if batch:
+            batch.status = "Preparing"
+
+    db.commit()
+
+    return {
+        "message": f"Handover {action}ed successfully",
+        "handover_id": handover.id,
+        "status": handover.status
+    }
+
+
+# ==========================================
+# ADMIN: VIEW BATCHES AND HANDOVERS
+# ==========================================
+
+@app.get(
+    "/admin/batches",
+    dependencies=[Depends(verify_admin)]
+)
+def admin_get_batches(
+    db: Session = Depends(get_db)
+):
+    return db.query(MaterialBatch).order_by(
+        MaterialBatch.created_at.desc()
+    ).all()
+
+
+@app.get(
+    "/admin/handovers",
+    dependencies=[Depends(verify_admin)]
+)
+def admin_get_handovers(
+    db: Session = Depends(get_db)
+):
+    return db.query(BatchHandover).order_by(
+        BatchHandover.created_at.desc()
+    ).all()
+
+
+# ==========================================
+# RESTRICTED STATUS UPDATE
+# ==========================================
+
+@app.put("/requests/{tracking_id}/status")
+def update_request_status(
+    tracking_id: str,
+    update: StatusUpdate,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user)
+):
+    if current_user.role != "admin":
+        raise HTTPException(
+            status_code=403,
+            detail="Only administrators can use this status endpoint"
+        )
+
+    collection = db.query(DBCollectionRequest).filter(
+        DBCollectionRequest.tracking_id == tracking_id
+    ).first()
+
+    if not collection:
+        raise HTTPException(
+            status_code=404,
+            detail="Collection request not found"
+        )
+
+    allowed_transitions = {
+        "Requested": "Assigned",
+        "Assigned": "Scheduled",
+        "Scheduled": "Collected",
+        "Collected": "Received"
+    }
+
+    expected_status = allowed_transitions.get(collection.status)
+
+    if update.status != expected_status:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Invalid status transition. Expected: {expected_status}"
+        )
+
+    collection.status = update.status
+
+    add_history(
+        db,
+        tracking_id,
+        update.status,
+        update.remarks,
+        current_user
+    )
+
+    db.commit()
+
+    return {
+        "message": "Status updated successfully",
+        "tracking_id": tracking_id,
+        "current_status": collection.status
     }

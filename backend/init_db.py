@@ -8,10 +8,15 @@ from models import (
     Partner,
     PartnerApplication,
     PartnerOffer,
-    User
+    RecyclerPriceOffer,
+    User,
+    Collector,
+    MaterialBatch,
+    MaterialBatchItem,
+    BatchHandover
 )
 
-# Create new tables, including partner_offers
+# Create any missing tables
 Base.metadata.create_all(bind=engine)
 
 
@@ -40,17 +45,32 @@ def add_missing_columns(table_name, new_columns):
 # Collection requests
 add_missing_columns("collection_requests", {
     "user_id": "INTEGER",
-    "assigned_partner_id": "INTEGER"
+    "assigned_partner_id": "INTEGER",
+    "assigned_collector_id": "INTEGER",
+    "collected_quantity": "INTEGER",
+    "collected_weight": "FLOAT",
+    "collected_at": "TIMESTAMP WITH TIME ZONE"
 })
 
-# Partner details
+# Partners
 add_missing_columns("partners", {
     "organisation_type": "VARCHAR",
     "verification_status": "VARCHAR DEFAULT 'Pending Verification'",
     "registration_number": "VARCHAR",
     "authorization_details": "TEXT",
     "verification_notes": "TEXT",
-    "verified_at": "TIMESTAMP",
+    "verified_at": "TIMESTAMP WITH TIME ZONE",
+    "latitude": "FLOAT",
+    "longitude": "FLOAT"
+})
+
+# Partner applications
+add_missing_columns("partner_applications", {
+    "registration_number": "VARCHAR",
+    "document_filename": "VARCHAR",
+    "document_path": "VARCHAR",
+    "verification_notes": "TEXT",
+    "verified_at": "TIMESTAMP WITH TIME ZONE",
     "latitude": "FLOAT",
     "longitude": "FLOAT"
 })
@@ -64,6 +84,10 @@ add_missing_columns("tracking_history", {
     "latitude": "FLOAT",
     "longitude": "FLOAT"
 })
-
+add_missing_columns("batch_handovers", {
+    "price_offer_id": "INTEGER REFERENCES recycler_price_offers(id)",
+    "agreed_price_per_kg": "NUMERIC(10, 2)",
+    "estimated_amount": "NUMERIC(12, 2)"
+})
 
 print("E-Cycle Vision database updated successfully!")
