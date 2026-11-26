@@ -1,6 +1,6 @@
 
 from fastapi import (
-    FastAPI, Depends, HTTPException, UploadFile, File
+    FastAPI, Depends, HTTPException, UploadFile, File,Body,Header
 )
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from fastapi.middleware.cors import CORSMiddleware
@@ -2372,4 +2372,55 @@ def update_request_status(
         "message": "Status updated successfully",
         "tracking_id": tracking_id,
         "current_status": collection.status
+    }
+
+@app.post("/admin/setup-admin-once")
+def setup_admin_once(
+    data: dict = Body(...),
+    x_admin_key: str = Header(...),
+    db: Session = Depends(get_db)
+):
+    if not ADMIN_API_KEY or not secrets.compare_digest(
+        x_admin_key, ADMIN_API_KEY
+    ):
+        raise HTTPException(
+            status_code=403,
+            detail="Invalid admin setup key"
+        )
+
+    email = str(data.get("email", "")).strip().lower()
+    password = str(data.get("password", ""))
+    full_name = str(data.get("full_name", "E-Cycle Admin")).strip()
+
+    if not email or "@" not in email:
+        raise HTTPException(status_code=400, detail="Invalid email")
+
+    if len(password) < 10:
+        raise HTTPException(
+            status_code=400,
+            detail="Password must contain at least 10 characters"
+        )
+
+    user = db.query(User).filter(User.email == email).first()
+
+    if user:
+        user.role = "admin"
+        user.is_active = 1
+        user.password_hash = password_hasher.hash(password)
+    else:
+        user = User(
+            full_name=full_name,
+            email=email,
+            password_hash=password_hasher.hash(password),
+            role="admin",
+            is_active=1
+        )
+        db.add(user)
+
+    db.commit()
+
+    return {
+        "message": "Admin account created successfully",
+        "email": email,
+        "role": "admin"
     }
